@@ -8,10 +8,18 @@
 # IMPORTANT:
 # - If samples.csv includes 't_event' and 'lead_time_mins', we keep them in df for evaluation,
 #   but we EXCLUDE them from model features so they are not normalized or used as inputs.
+#
+# MEMORY FIX:
+# - If top_k is provided, we only load ["patientunitstayid", "t_end"] + top_k ranked feature columns
+#   from features.parquet. This prevents loading a huge wide dataframe into RAM.
+#
+# ROBUSTNESS FIX:
+# - If rank CSV contains feature names not present in features.parquet (e.g. *_missing),
+#   we filter them out using the parquet schema (without reading the full dataset).
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -44,7 +52,6 @@ def _read_samples(samples_path: str) -> pd.DataFrame:
     df["t_end"] = pd.to_numeric(df["t_end"], errors="coerce")
     df["label"] = pd.to_numeric(df["label"], errors="coerce")
 
-    # Coerce optional cols if present
     if "t_event" in df.columns:
         df["t_event"] = pd.to_numeric(df["t_event"], errors="coerce")
     if "lead_time_mins" in df.columns:
@@ -65,17 +72,69 @@ def _read_samples(samples_path: str) -> pd.DataFrame:
     return df
 
 
-def _read_features(features_path: str) -> pd.DataFrame:
-    df = pd.read_parquet(features_path)
+def _parquet_schema_columns(features_path: str) -> Set[str]:
+    # Read only parquet schema (cheap) to know which columns exist
+    try:
+        import pyarrow.parquet as pq
+    except Exception as e:
+        raise ImportError(
+            "pyarrow is required to read parquet schema for top_k column filtering. "
+            f"Original error: {repr(e)}"
+        )
+
+    pf = pq.ParquetFile(features_path)
+    return set(pf.schema.names)
+
+
+def _load_ranked_features(rank_path: str, top_k: int, features_path: str) -> List[str]:
+    r = pd.read_csv(rank_path)
+    if "feature" not in r.columns:
+        raise ValueError("rank_path must be a CSV with a 'feature' column")
+
+    want = [x.strip() for x in r["feature"].astype(str).tolist()]
+    want = want[: int(top_k)]
+
+    existing = _parquet_schema_columns(features_path)
+    kept = [c for c in want if c in existing]
+
+    if len(kept) == 0:
+        # Give a helpful message including an example of the mismatch
+        example = want[0] if want else "(none)"
+        raise ValueError(
+            "None of the requested top_k ranked features were found in features.parquet. "
+            "This usually means your rank CSV was built on a different feature set "
+            "(e.g. it includes *_missing columns) than the parquet you are loading. "
+            f"Example requested feature: {example}"
+        )
+
+    if len(kept) < len(want):
+        # Non-fatal: just warn via print so the run continues
+        skipped = len(want) - len(kept)
+        print("#############################")
+        print("WARNING: rank_path contains features not present in features.parquet")
+        print(f"Requested top_k: {int(top_k)}")
+        print(f"Kept (found in parquet): {len(kept)}")
+        print(f"Skipped (missing from parquet): {skipped}")
+        print("Example missing features:")
+        miss_examples = [c for c in want if c not in existing][:10]
+        for m in miss_examples:
+            print(f" - {m}")
+        print("#############################")
+
+    return kept
+
+
+def _read_features(features_path: str, columns: Optional[List[str]] = None) -> pd.DataFrame:
+    df = pd.read_parquet(features_path, columns=columns)
 
     need = {"patientunitstayid", "t_end"}
     missing = need - set(df.columns)
     if missing:
         raise ValueError(f"features.parquet missing columns: {sorted(missing)}")
 
-    df = df.copy()
-
+    # Avoid df.copy() here (can double memory)
     df = df.replace([np.inf, -np.inf], np.nan)
+
     df["patientunitstayid"] = pd.to_numeric(df["patientunitstayid"], errors="coerce")
     df["t_end"] = pd.to_numeric(df["t_end"], errors="coerce")
     df = df.dropna(subset=["patientunitstayid", "t_end"])
@@ -87,13 +146,16 @@ def _read_features(features_path: str) -> pd.DataFrame:
 
 
 def _select_feature_columns(df: pd.DataFrame) -> List[str]:
-    # Exclude identifiers, labels, split, and evaluation-only time columns.
     drop = {
-    "patientunitstayid", "t_end", "label", "split",
-    "t_event", "lead_time_mins",
-    "t_event_missing", "lead_time_mins_missing",
+        "patientunitstayid",
+        "t_end",
+        "label",
+        "split",
+        "t_event",
+        "lead_time_mins",
+        "t_event_missing",
+        "lead_time_mins_missing",
     }
-
 
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     cols = [c for c in numeric_cols if c not in drop]
@@ -124,6 +186,7 @@ def _restrict_to_topk_features(
     top_k: int,
     rank_path: Optional[str],
 ) -> List[str]:
+    # Safety net only (after merge). Primary filtering is done at parquet read time.
     top_k = int(top_k)
     if top_k <= 0:
         raise ValueError("top_k must be a positive integer")
@@ -170,7 +233,7 @@ class PatientSequenceDataset(Dataset):
         split: str,
         disease: Optional[config.DiseaseSpec] = None,
         max_len: int = 128,
-        seed: int = 42,  # kept for compatibility
+        seed: int = 42,
         normalize: bool = True,
         cached_norm_path: Optional[str] = None,
         top_k: Optional[int] = None,
@@ -192,7 +255,17 @@ class PatientSequenceDataset(Dataset):
         features_path = str(config.features_path(disease))
 
         samples = _read_samples(samples_path)
-        feats = _read_features(features_path)
+
+        # MEMORY + ROBUSTNESS FIX:
+        feat_columns = None
+        if top_k is not None:
+            if rank_path is None:
+                raise ValueError("top_k was set but rank_path is None")
+
+            ranked = _load_ranked_features(rank_path, top_k=int(top_k), features_path=features_path)
+            feat_columns = ["patientunitstayid", "t_end"] + ranked
+
+        feats = _read_features(features_path, columns=feat_columns)
 
         _assert_patient_split_consistent(samples)
 
@@ -204,13 +277,13 @@ class PatientSequenceDataset(Dataset):
 
         feature_cols = _select_feature_columns(df)
 
-        # filter by provided split
+        # Filter by split
         df = df[df["split"] == split].copy()
         df = df.sort_values(["patientunitstayid", "t_end"]).reset_index(drop=True)
         if df.empty:
             raise ValueError(f"No rows left after applying split='{split}'. Check samples.csv split column.")
 
-        # Optional: restrict to top-K features
+        # Safety net top-k restriction
         if top_k is not None:
             feature_cols = _restrict_to_topk_features(df, feature_cols, top_k=top_k, rank_path=rank_path)
 
@@ -238,7 +311,7 @@ class PatientSequenceDataset(Dataset):
         self.df = df
         self.pids = df["patientunitstayid"].unique().astype(np.int64)
 
-        # pre-store group indices
+        # Pre-store group indices
         self._groups: List[np.ndarray] = []
         pid_values = df["patientunitstayid"].to_numpy(dtype=np.int64)
 
@@ -260,10 +333,9 @@ class PatientSequenceDataset(Dataset):
         idx = self._groups[i]
         sub = self.df.iloc[idx]
 
-        x = sub[self.feature_cols].to_numpy(dtype=np.float32)  # (T, D)
-        y = sub["label"].to_numpy(dtype=np.int64)  # (T,)
+        x = sub[self.feature_cols].to_numpy(dtype=np.float32)
+        y = sub["label"].to_numpy(dtype=np.int64)
 
-        # truncate from end
         if len(y) > self.max_len:
             x = x[-self.max_len :]
             y = y[-self.max_len :]
@@ -278,14 +350,6 @@ class PatientSequenceDataset(Dataset):
 
 
 def pad_collate(batch):
-    """
-    batch: list of (X (Ti,D), y (Ti,), length)
-    returns:
-      X_pad: (B, T_max, D)
-      y_pad: (B, T_max)
-      mask:  (B, T_max) 1 for valid
-      lengths: (B,)
-    """
     xs, ys, lens = zip(*batch)
     lengths = torch.stack(lens, dim=0)
 

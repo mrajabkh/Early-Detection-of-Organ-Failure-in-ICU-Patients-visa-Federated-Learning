@@ -29,11 +29,44 @@ def _leak_cols() -> Set[str]:
 
 
 def _is_vital_feature(col: str) -> bool:
-    # Define vitals as bedside physiologic signals from:
-    # - vitalPeriodic (vp_)
-    # - vitalAperiodic (va_)
     c = str(col)
     return c.startswith("vp_") or c.startswith("va_")
+
+
+#############################
+# Memory-safe numeric cleaning
+#############################
+def _replace_inf_with_nan_numeric_inplace(df: pd.DataFrame, chunk_cols: int = 128) -> None:
+    """
+    Memory-safe inf -> NaN replacement only on numeric float columns.
+    Avoids pandas DataFrame.replace which can allocate huge boolean masks.
+    """
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if not num_cols:
+        return
+
+    for i in range(0, len(num_cols), chunk_cols):
+        cols = num_cols[i : i + chunk_cols]
+        block = df[cols].to_numpy(copy=False)
+        if np.issubdtype(block.dtype, np.floating):
+            bad = ~np.isfinite(block)
+            if bad.any():
+                block[bad] = np.nan
+
+
+def _downcast_float64_to_float32_inplace(df: pd.DataFrame, chunk_cols: int = 128) -> None:
+    """
+    Downcast float64 columns to float32 to cut memory usage.
+    Done in chunks to avoid peak memory spikes.
+    """
+    float_cols = [c for c, dt in df.dtypes.items() if dt == np.float64]
+    if not float_cols:
+        return
+
+    for i in range(0, len(float_cols), chunk_cols):
+        cols = float_cols[i : i + chunk_cols]
+        # astype on a block is much cheaper than on the whole frame repeatedly
+        df.loc[:, cols] = df[cols].astype(np.float32)
 
 
 #############################
@@ -71,8 +104,9 @@ def load_samples(samples_csv_path: str | pd.PathLike) -> pd.DataFrame:
     df["t_end"] = pd.to_numeric(df["t_end"], errors="coerce")
     df["label"] = pd.to_numeric(df["label"], errors="coerce")
 
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna(subset=["patientunitstayid", "t_end", "label"]).copy()
+    # Avoid dropna(...).copy() on huge frames; filter with a mask
+    mask = df["patientunitstayid"].notna() & df["t_end"].notna() & df["label"].notna()
+    df = df.loc[mask]
 
     df["patientunitstayid"] = df["patientunitstayid"].astype(np.int64)
     df["t_end"] = df["t_end"].astype(np.int64)
@@ -92,14 +126,23 @@ def load_features(features_parquet_path: str | pd.PathLike) -> pd.DataFrame:
     if missing:
         raise ValueError(f"features.parquet missing required columns: {sorted(missing)}")
 
+    # Coerce keys without copying the whole dataframe
     df["patientunitstayid"] = pd.to_numeric(df["patientunitstayid"], errors="coerce")
     df["t_end"] = pd.to_numeric(df["t_end"], errors="coerce")
 
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna(subset=["patientunitstayid", "t_end"]).copy()
+    # Avoid dropna(...).copy() (can spike RAM); use mask + loc
+    mask = df["patientunitstayid"].notna() & df["t_end"].notna()
+    df = df.loc[mask]
 
     df["patientunitstayid"] = df["patientunitstayid"].astype(np.int64)
     df["t_end"] = df["t_end"].astype(np.int64)
+
+    # Clean numeric floats (inf -> nan) safely
+    _replace_inf_with_nan_numeric_inplace(df, chunk_cols=128)
+
+    # Downcast float64 -> float32 to reduce memory footprint
+    _downcast_float64_to_float32_inplace(df, chunk_cols=128)
+
     return df
 
 
@@ -118,14 +161,6 @@ def build_xy(
         how="left",
         validate="one_to_one",
     )
-
-    if merged.isna().all(axis=1).any():
-        bad = merged[merged.isna().all(axis=1)][key_cols].head(10)
-        raise ValueError(
-            "Some sampled windows have no matching features (all-NaN row after merge). "
-            "Example missing keys:\n"
-            f"{bad.to_string(index=False)}"
-        )
 
     y = merged["label"].astype(int)
 
@@ -147,6 +182,17 @@ def build_xy(
     # Numeric only
     X_numeric = merged[feature_cols].select_dtypes(include=[np.number]).copy()
 
+    # Correct "no matching features" check: all numeric features NaN
+    if not X_numeric.empty:
+        all_nan_feat = X_numeric.isna().all(axis=1)
+        if all_nan_feat.any():
+            bad = merged.loc[all_nan_feat, key_cols].head(10)
+            raise ValueError(
+                "Some sampled windows have no matching features (all-NaN numeric features after merge). "
+                "Example missing keys:\n"
+                f"{bad.to_string(index=False)}"
+            )
+
     # Missingness indicators ONLY for vitals (vp_, va_)
     vital_cols = [c for c in X_numeric.columns if _is_vital_feature(c)]
     if vital_cols:
@@ -154,7 +200,7 @@ def build_xy(
         vital_missing_cols = cols_with_missing[cols_with_missing].index.tolist()
 
         if vital_missing_cols:
-            missing_mask = X_numeric[vital_missing_cols].isna().astype(int)
+            missing_mask = X_numeric[vital_missing_cols].isna().astype(np.int8)
             missing_mask.columns = [f"{c}_missing" for c in missing_mask.columns]
             X = pd.concat([X_numeric, missing_mask], axis=1)
         else:
@@ -211,7 +257,6 @@ def split_and_preprocess(
     X_test_valid = X_test.loc[:, valid_feature_names]
 
     imputer = SimpleImputer(strategy=impute_strategy)
-
     X_train_imputed = imputer.fit_transform(X_train_valid)
     X_test_imputed = imputer.transform(X_test_valid)
 

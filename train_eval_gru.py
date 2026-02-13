@@ -2,6 +2,11 @@
 # Train + evaluate a supervised GRU early detection model on window-sequence data.
 # Reports AUROC and AUPRC on train/val/test splits.
 # Saves ROC and PR curves for the TEST split.
+#
+# NEW:
+# - Uses pos_weight in BCEWithLogitsLoss during TRAINING to handle class imbalance.
+# - pos_weight computed from TRAIN split masked labels: n_neg / n_pos
+# - Optional clipping via config.POS_WEIGHT_MAX (if not present, no clipping).
 
 from __future__ import annotations
 
@@ -131,7 +136,6 @@ def _roc_curve_manual(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[np.ndarr
     tpr = tp / float(n_pos)
     fpr = fp / float(n_neg)
 
-    # add endpoints
     fpr = np.concatenate([np.array([0.0]), fpr, np.array([1.0])])
     tpr = np.concatenate([np.array([0.0]), tpr, np.array([1.0])])
 
@@ -166,11 +170,48 @@ def _flatten_loader_probs(model, loader, device) -> Tuple[np.ndarray, np.ndarray
     return np.concatenate(all_y), np.concatenate(all_p)
 
 
+#############################
+# Loss
+#############################
 def masked_bce(logits, targets, mask, pos_weight=None):
     loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight)
     loss = loss_fn(logits, targets.float())
     loss = loss * mask.float()
     return loss.sum() / mask.sum().clamp_min(1.0)
+
+
+def _compute_pos_weight_from_loader(train_loader: DataLoader, device: str) -> torch.Tensor | None:
+    """
+    Compute pos_weight = n_neg / n_pos from TRAIN masked labels.
+    Optional clipping: if config.POS_WEIGHT_MAX exists, clip to that max.
+    If no positives found, returns None.
+    """
+    n_pos = 0
+    n_neg = 0
+
+    for x, y, mask, lengths in train_loader:
+        y_np = y.detach().cpu().numpy().astype(np.int64)
+        m_np = mask.detach().cpu().numpy().astype(np.float32)
+
+        valid = m_np > 0.5
+        if not np.any(valid):
+            continue
+
+        yv = y_np[valid]
+        n_pos += int((yv == 1).sum())
+        n_neg += int((yv == 0).sum())
+
+    if n_pos == 0:
+        return None
+
+    pw = float(n_neg) / float(n_pos)
+
+    # Clip only if user defines a max in config
+    if hasattr(config, "POS_WEIGHT_MAX") and config.POS_WEIGHT_MAX is not None:
+        pw_max = float(config.POS_WEIGHT_MAX)
+        pw = float(np.clip(pw, 1.0, pw_max))
+
+    return torch.tensor([pw], dtype=torch.float32, device=device)
 
 
 #############################
@@ -219,15 +260,26 @@ def evaluate(model, loader, device):
             all_s.append(ys)
 
     if not all_y:
-        return {"loss": float("nan"), "auroc": float("nan"), "auprc": float("nan")}
+        return {
+            "loss": float("nan"),
+            "auroc": float("nan"),
+            "auprc": float("nan"),
+            "n_pos": float("nan"),
+            "n_neg": float("nan"),
+        }
 
     y_true = np.concatenate(all_y)
     y_score = np.concatenate(all_s)
+
+    n_pos = int((y_true == 1).sum())
+    n_neg = int((y_true == 0).sum())
 
     return {
         "loss": total_loss / max(len(loader), 1),
         "auroc": roc_auc_score_manual(y_true, y_score),
         "auprc": avg_precision_score_manual(y_true, y_score),
+        "n_pos": float(n_pos),
+        "n_neg": float(n_neg),
     }
 
 
@@ -340,6 +392,28 @@ def train_and_eval(
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
+        #############################
+        # pos_weight (TRAIN only)
+        #############################
+        use_pos_weight = True
+        if hasattr(config, "USE_POS_WEIGHT"):
+            use_pos_weight = bool(config.USE_POS_WEIGHT)
+
+        pos_weight = None
+        if use_pos_weight:
+            pos_weight = _compute_pos_weight_from_loader(train_loader, device=cfg.device)
+
+            print("#############################")
+            print("Pos weight configuration")
+            print(f"USE_POS_WEIGHT: {use_pos_weight}")
+            if pos_weight is None:
+                print("pos_weight: None (no positives found in train masked labels)")
+            else:
+                print(f"pos_weight: {float(pos_weight.item()):.6f}")
+                if hasattr(config, "POS_WEIGHT_MAX") and config.POS_WEIGHT_MAX is not None:
+                    print(f"POS_WEIGHT_MAX: {float(config.POS_WEIGHT_MAX):.6f}")
+            print("#############################")
+
         best_val = -1.0
         best_state = None
         bad_epochs = 0
@@ -352,7 +426,7 @@ def train_and_eval(
                 mask = mask.to(cfg.device)
 
                 optimizer.zero_grad()
-                loss = masked_bce(model(x, lengths), y, mask)
+                loss = masked_bce(model(x, lengths), y, mask, pos_weight=pos_weight)
                 loss.backward()
                 optimizer.step()
 
@@ -366,7 +440,8 @@ def train_and_eval(
                 if bad_epochs >= cfg.patience:
                     break
 
-        model.load_state_dict(best_state)
+        if best_state is not None:
+            model.load_state_dict(best_state)
 
         train_metrics = evaluate(model, train_loader, cfg.device)
         val_metrics = evaluate(model, val_loader, cfg.device)
@@ -386,6 +461,7 @@ def train_and_eval(
             "test": test_metrics,
             "n_features": len(train_ds.feature_cols),
             "curve_paths": curve_paths,
+            "pos_weight": (float(pos_weight.item()) if pos_weight is not None else None),
         }
 
     if memory_usage is not None:
@@ -403,6 +479,7 @@ def train_and_eval(
         "n_features": out["n_features"],
         "roc_path": out.get("curve_paths", {}).get("roc_path", None),
         "pr_path": out.get("curve_paths", {}).get("pr_path", None),
+        "pos_weight": out.get("pos_weight", None),
     }
 
     return out

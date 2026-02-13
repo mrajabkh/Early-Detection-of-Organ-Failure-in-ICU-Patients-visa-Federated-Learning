@@ -47,6 +47,8 @@ def run_sweep(
             "val_auprc": out["val"]["auprc"],
             "test_auroc": out["test"]["auroc"],
             "test_auprc": out["test"]["auprc"],
+            "test_n_pos": out["test"].get("n_pos", float("nan")),
+            "test_n_neg": out["test"].get("n_neg", float("nan")),
             "cpu_peak_mib": out["extra"]["cpu_peak_mib"],
             "runtime_sec": out["extra"]["runtime_sec"],
         }
@@ -63,6 +65,8 @@ def run_sweep(
         "val_auprc",
         "test_auroc",
         "test_auprc",
+        "test_n_pos",
+        "test_n_neg",
         "cpu_peak_mib",
         "runtime_sec",
     ]
@@ -84,6 +88,6 @@ def run_sweep(
 
 
 if __name__ == "__main__":
-    ks = [20, 40, 60, 80, 100, None]
+    ks = [20, 40, 60, 80, 100, 120]
     rank_path = str(config.stability_combined_path(config.DISEASE))
     run_sweep(ks=ks, rank_path=rank_path)

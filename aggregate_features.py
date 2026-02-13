@@ -1,15 +1,20 @@
 # aggregate_features.py
-# Build rolling-window features.parquet from samples.csv using eICU tables (optimized).
-# Includes:
-# - respiratoryCharting pivot (top-N numeric labels)
-# - nurseCharting pivot (top-N numeric labels)
+# Build rolling-window features.parquet from samples.csv using eICU tables (memory safe).
+#
+# Key memory fixes:
+# - Do NOT repeatedly pd.concat into a growing feats dataframe.
+# - Build blocks in a list and concat once at the end.
+# - Use float32 feature blocks.
+# - For charting pivots, DO NOT concat many small dataframes (causes consolidation OOM).
+#   Instead, preallocate a numpy array and fill it.
+#
 # Location: Project/Code/aggregate_features.py
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -22,8 +27,8 @@ import config
 #############################
 class WindowAgg:
     def __init__(self, n_rows: int, col_names: List[str]) -> None:
-        self.n = n_rows
-        self.cols = col_names
+        self.n = int(n_rows)
+        self.cols = list(col_names)
 
         self.count = {c: np.zeros(self.n, dtype=np.int32) for c in self.cols}
         self.sum = {c: np.zeros(self.n, dtype=np.float64) for c in self.cols}
@@ -58,7 +63,7 @@ class WindowAgg:
                 self.last_val[c][idx2] = vv[newer]
 
     def finalize(self, prefix: str) -> pd.DataFrame:
-        out = {}
+        out: Dict[str, np.ndarray] = {}
         for c in self.cols:
             cnt = self.count[c].astype(np.float64)
 
@@ -77,12 +82,12 @@ class WindowAgg:
                 mn[nonzero] = self.minv[c][nonzero]
                 mx[nonzero] = self.maxv[c][nonzero]
 
-            out[f"{prefix}{c}_min"] = mn
-            out[f"{prefix}{c}_max"] = mx
-            out[f"{prefix}{c}_mean"] = mean
-            out[f"{prefix}{c}_std"] = std
-            out[f"{prefix}{c}_count"] = self.count[c].astype(np.float64)
-            out[f"{prefix}{c}_last"] = last
+            out[f"{prefix}{c}_min"] = mn.astype(np.float32)
+            out[f"{prefix}{c}_max"] = mx.astype(np.float32)
+            out[f"{prefix}{c}_mean"] = mean.astype(np.float32)
+            out[f"{prefix}{c}_std"] = std.astype(np.float32)
+            out[f"{prefix}{c}_count"] = self.count[c].astype(np.float32)
+            out[f"{prefix}{c}_last"] = last.astype(np.float32)
 
         return pd.DataFrame(out)
 
@@ -100,9 +105,13 @@ def load_samples(samples_path: Path) -> pd.DataFrame:
     missing = need - set(df.columns)
     if missing:
         raise ValueError(f"samples file missing columns: {sorted(missing)}")
-    df["patientunitstayid"] = df["patientunitstayid"].astype(int)
-    df["t_end"] = df["t_end"].astype(int)
-    df["label"] = df["label"].astype(int)
+    df["patientunitstayid"] = pd.to_numeric(df["patientunitstayid"], errors="coerce")
+    df["t_end"] = pd.to_numeric(df["t_end"], errors="coerce")
+    df["label"] = pd.to_numeric(df["label"], errors="coerce")
+    df = df.dropna(subset=["patientunitstayid", "t_end", "label"])
+    df["patientunitstayid"] = df["patientunitstayid"].astype(np.int64)
+    df["t_end"] = df["t_end"].astype(np.int64)
+    df["label"] = df["label"].astype(np.int64)
     return df
 
 
@@ -181,7 +190,56 @@ def safe_label_to_col(label: str) -> str:
 
 
 #############################
-# Static features (broadcast to windows)
+# Missingness masks (vitals only)
+#############################
+def add_vitals_missingness_masks(feats: pd.DataFrame) -> pd.DataFrame:
+    """
+    Memory-safe missingness features for vitals using *_count columns.
+
+    For each vp_/va_ signal that has:
+        <prefix><signal>_count
+    we define missing_base = (count == 0) and then create:
+        <prefix><signal>_min_missing
+        <prefix><signal>_max_missing
+        <prefix><signal>_mean_missing
+        <prefix><signal>_std_missing
+        <prefix><signal>_last_missing
+
+    This matches the meaning of per-stat NaN-based masks from WindowAgg.finalize(),
+    but avoids pandas concat/consolidation OOM on extremely wide frames.
+    """
+    stat_suffixes = ["min", "max", "mean", "std", "last"]
+
+    # Find vp_/va_ count columns
+    count_cols = [
+        c for c in feats.columns
+        if (str(c).startswith("vp_") or str(c).startswith("va_")) and str(c).endswith("_count")
+    ]
+    if not count_cols:
+        return feats
+
+    # Add columns one-by-one to avoid pandas consolidation
+    for c_count in count_cols:
+        base = str(c_count)[:-len("_count")]  # e.g. vp_sao2
+        cnt = feats[c_count].to_numpy(copy=False)
+
+        # Missing if no measurements in window
+        missing_base = (np.nan_to_num(cnt, nan=0.0) <= 0.0).astype(np.float32)
+
+        for suf in stat_suffixes:
+            stat_col = f"{base}_{suf}"
+            miss_col = f"{base}_{suf}_missing"
+
+            # Only create if the underlying stat column exists
+            if stat_col in feats.columns and miss_col not in feats.columns:
+                feats[miss_col] = missing_base
+
+    return feats
+
+
+
+#############################
+# Static features
 #############################
 def build_static_features(data_dir: Path, samples_df: pd.DataFrame) -> pd.DataFrame:
     pids_set = set(samples_df["patientunitstayid"].unique().tolist())
@@ -220,77 +278,15 @@ def build_static_features(data_dir: Path, samples_df: pd.DataFrame) -> pd.DataFr
             on="patientunitstayid",
             how="left",
         ).drop(columns=["patientunitstayid"])
+
         merged.columns = [f"pt_{c}" for c in merged.columns]
         out = pd.concat([out, merged], axis=1)
-    else:
-        print(f"WARNING: missing file, skipping patient static: {patient_path}")
 
-    aps_path = data_dir / "apacheApsVar.csv.gz"
-    if safe_exists(aps_path):
-        aps = pd.read_csv(aps_path, compression="infer", low_memory=False)
-        if "patientunitstayid" in aps.columns:
-            aps = aps[aps["patientunitstayid"].isin(pids_set)].copy()
-            aps = aps.drop(columns=["apacheapsvarid"], errors="ignore")
-            aps = aps.set_index("patientunitstayid")
-            aps.columns = [f"aps_{c}" for c in aps.columns]
-            merged = samples_df[["patientunitstayid"]].merge(
-                aps.reset_index(),
-                on="patientunitstayid",
-                how="left",
-            ).drop(columns=["patientunitstayid"])
-            out = pd.concat([out, merged], axis=1)
-    else:
-        print(f"WARNING: missing file, skipping apacheApsVar: {aps_path}")
-
-    apred_path = data_dir / "apachePredVar.csv.gz"
-    if safe_exists(apred_path):
-        apred = pd.read_csv(apred_path, compression="infer", low_memory=False)
-        if "patientunitstayid" in apred.columns:
-            apred = apred[apred["patientunitstayid"].isin(pids_set)].copy()
-            apred = apred.drop(columns=["apachepredvarid"], errors="ignore")
-            apred = apred.set_index("patientunitstayid")
-            apred.columns = [f"apred_{c}" for c in apred.columns]
-            merged = samples_df[["patientunitstayid"]].merge(
-                apred.reset_index(),
-                on="patientunitstayid",
-                how="left",
-            ).drop(columns=["patientunitstayid"])
-            out = pd.concat([out, merged], axis=1)
-    else:
-        print(f"WARNING: missing file, skipping apachePredVar: {apred_path}")
-
-    ares_path = data_dir / "apachePatientResult.csv.gz"
-    if safe_exists(ares_path):
-        ares = pd.read_csv(ares_path, compression="infer", low_memory=False)
-        if "patientunitstayid" in ares.columns:
-            ares = ares[ares["patientunitstayid"].isin(pids_set)].copy()
-            ares = ares.drop(columns=["apachepatientresultsid"], errors="ignore")
-
-            early_cols = [
-                "acutephysiologyscore",
-                "apachescore",
-                "apacheversion",
-                "predictedicumortality",
-                "predictedhospitalmortality",
-            ]
-            early_cols = [c for c in early_cols if c in ares.columns]
-            ares = ares[["patientunitstayid"] + early_cols].set_index("patientunitstayid")
-            ares.columns = [f"ares_{c}" for c in ares.columns]
-
-            merged = samples_df[["patientunitstayid"]].merge(
-                ares.reset_index(),
-                on="patientunitstayid",
-                how="left",
-            ).drop(columns=["patientunitstayid"])
-            out = pd.concat([out, merged], axis=1)
-    else:
-        print(f"WARNING: missing file, skipping apachePatientResult: {ares_path}")
-
-    return out
+    return out.astype(np.float32, copy=False)
 
 
 #############################
-# Numeric time series table aggregation (optimized)
+# Numeric time series aggregation
 #############################
 def process_numeric_timeseries_table(
     table_path: Path,
@@ -380,7 +376,7 @@ def process_numeric_timeseries_table(
         row_idx = map_df["row_idx"].to_numpy(dtype=np.int32)
         t = map_df["time"].to_numpy(dtype=np.int64)
 
-        values = {}
+        values: Dict[str, np.ndarray] = {}
         for c in numeric_cols:
             arr = chunk[c].to_numpy(dtype=np.float64)
             values[c] = arr[event_i]
@@ -434,6 +430,17 @@ def find_top_numeric_labels(
     return [lbl for lbl, _ in sorted_labels[:top_n]]
 
 
+def _pivot_feature_names(prefix: str, slug: str) -> List[str]:
+    return [
+        f"{prefix}{slug}_min",
+        f"{prefix}{slug}_max",
+        f"{prefix}{slug}_mean",
+        f"{prefix}{slug}_std",
+        f"{prefix}{slug}_count",
+        f"{prefix}{slug}_last",
+    ]
+
+
 def process_charting_pivot(
     table_path: Path,
     pid_col: str,
@@ -449,7 +456,7 @@ def process_charting_pivot(
     chunksize: int = 800_000,
 ) -> pd.DataFrame:
     print("#############################")
-    print(f"Processing {table_path.name} (pivot by label)")
+    print(f"Processing {table_path.name} (pivot by label, memory safe)")
     print(f"Top labels: {len(top_labels)}")
     print("#############################")
 
@@ -528,27 +535,28 @@ def process_charting_pivot(
 
     print(f"{table_path.name} mapped event->window pairs: {mapped_total}")
 
-    out_parts = []
+    slugs = [label_to_slug[lbl] for lbl in top_labels]
+    col_names: List[str] = []
+    for slug in slugs:
+        col_names.extend(_pivot_feature_names(prefix=prefix, slug=slug))
+
+    out_mat = np.zeros((n_samples, len(col_names)), dtype=np.float32)
+
+    col_ptr = 0
     for lbl in top_labels:
         slug = label_to_slug[lbl]
         df_lbl = label_to_agg[lbl].finalize(prefix=f"{prefix}{slug}_")
         df_lbl = df_lbl.rename(columns=lambda c: c.replace(f"{prefix}{slug}_value_", f"{prefix}{slug}_"))
-        out_parts.append(df_lbl)
 
-    out = pd.concat(out_parts, axis=1) if out_parts else pd.DataFrame(index=np.arange(n_samples))
-
-    if out.columns.duplicated().any():
-        new_cols = []
-        seen: Dict[str, int] = {}
-        for c in out.columns:
-            if c not in seen:
-                seen[c] = 1
-                new_cols.append(c)
+        want_cols = _pivot_feature_names(prefix=prefix, slug=slug)
+        for c in want_cols:
+            if c in df_lbl.columns:
+                out_mat[:, col_ptr] = df_lbl[c].to_numpy(dtype=np.float32, copy=False)
             else:
-                seen[c] += 1
-                new_cols.append(f"{c}__dup{seen[c]}")
-        out.columns = new_cols
+                out_mat[:, col_ptr] = 0.0
+            col_ptr += 1
 
+    out = pd.DataFrame(out_mat, columns=col_names)
     return out
 
 
@@ -568,7 +576,7 @@ def process_count_table(
 ) -> pd.DataFrame:
     if not safe_exists(table_path):
         print(f"WARNING: missing file, skipping: {table_path}")
-        return pd.DataFrame({out_col: np.zeros(n_samples, dtype=np.float64)})
+        return pd.DataFrame({out_col: np.zeros(n_samples, dtype=np.float32)})
 
     cnt = np.zeros(n_samples, dtype=np.int32)
 
@@ -606,7 +614,7 @@ def process_count_table(
         np.add.at(cnt, row_idx, 1)
 
     print(f"{out_col}: mapped pairs {mapped_total}")
-    return pd.DataFrame({out_col: cnt.astype(np.float64)})
+    return pd.DataFrame({out_col: cnt.astype(np.float32)})
 
 
 def process_treatment_dialysis(
@@ -620,8 +628,8 @@ def process_treatment_dialysis(
     if not safe_exists(table_path):
         print(f"WARNING: missing file, skipping: {table_path}")
         return pd.DataFrame({
-            "treatment_count_in_window": np.zeros(n_samples, dtype=np.float64),
-            "treatment_dialysis_any": np.zeros(n_samples, dtype=np.float64),
+            "treatment_count_in_window": np.zeros(n_samples, dtype=np.float32),
+            "treatment_dialysis_any": np.zeros(n_samples, dtype=np.float32),
         })
 
     tr_cnt = np.zeros(n_samples, dtype=np.int32)
@@ -669,8 +677,8 @@ def process_treatment_dialysis(
 
     print(f"treatment mapped pairs {mapped_total}")
     return pd.DataFrame({
-        "treatment_count_in_window": tr_cnt.astype(np.float64),
-        "treatment_dialysis_any": dial_any.astype(np.float64),
+        "treatment_count_in_window": tr_cnt.astype(np.float32),
+        "treatment_dialysis_any": dial_any.astype(np.float32),
     })
 
 
@@ -684,12 +692,10 @@ def process_infusion_vasopressor_any(
 ) -> pd.DataFrame:
     if not safe_exists(table_path):
         print(f"WARNING: missing file, skipping: {table_path}")
-        return pd.DataFrame({"drug_vasopressor_any": np.zeros(n_samples, dtype=np.float64)})
+        return pd.DataFrame({"drug_vasopressor_any": np.zeros(n_samples, dtype=np.float32)})
 
     vaso_any = np.zeros(n_samples, dtype=np.int32)
-    vaso_pattern = (
-        "norepi|norad|dopamine|epinephrine|adrenaline|phenylephrine|vasopressin|levophed"
-    )
+    vaso_pattern = "norepi|norad|dopamine|epinephrine|adrenaline|phenylephrine|vasopressin|levophed"
 
     reader = pd.read_csv(
         table_path,
@@ -731,7 +737,7 @@ def process_infusion_vasopressor_any(
         vaso_any[row_idx] = 1
 
     print(f"vasopressor mapped pairs {mapped_total}")
-    return pd.DataFrame({"drug_vasopressor_any": vaso_any.astype(np.float64)})
+    return pd.DataFrame({"drug_vasopressor_any": vaso_any.astype(np.float32)})
 
 
 #############################
@@ -743,34 +749,31 @@ def main() -> None:
     out_features = config.features_path(config.DISEASE)
 
     print("#############################")
-    print("Aggregating rolling-window features (optimized + chart pivots)")
+    print("Aggregating rolling-window features (memory safe)")
     print("#############################")
     print(f"Data dir: {data_dir}")
     print(f"Samples: {samples_csv}")
     print(f"Output features: {out_features}")
+    print("#############################")
 
     samples_df = load_samples(samples_csv)
     sample_index_df = make_sample_index_df(samples_df)
 
     n_samples = len(samples_df)
-    history_mins = config.HISTORY_MINS
-    stride_mins = config.STRIDE_MINS
+    history_mins = int(config.HISTORY_MINS)
+    stride_mins = int(config.STRIDE_MINS)
 
-    feats = pd.DataFrame({
-        "patientunitstayid": samples_df["patientunitstayid"].values.astype(int),
-        "t_end": samples_df["t_end"].values.astype(int),
+    blocks: List[pd.DataFrame] = []
+
+    base = pd.DataFrame({
+        "patientunitstayid": samples_df["patientunitstayid"].values.astype(np.int64),
+        "t_end": samples_df["t_end"].values.astype(np.int64),
     })
+    blocks.append(base)
 
-    feats = pd.concat([feats, build_static_features(data_dir, samples_df)], axis=1)
+    blocks.append(build_static_features(data_dir, samples_df))
 
-    # IMPORTANT: remove indirect leakage from Apache-derived features
-    drop_prefixes = ("aps_", "apred_", "ares_")
-    apache_cols = [c for c in feats.columns if c.startswith(drop_prefixes)]
-    if apache_cols:
-        print(f"Dropping leak-prone Apache features: {len(apache_cols)} columns")
-        feats = feats.drop(columns=apache_cols)
-
-    feats = pd.concat([feats, process_numeric_timeseries_table(
+    blocks.append(process_numeric_timeseries_table(
         table_path=data_dir / "vitalPeriodic.csv.gz",
         pid_col="patientunitstayid",
         offset_col="observationoffset",
@@ -788,9 +791,9 @@ def main() -> None:
         history_mins=history_mins,
         stride_mins=stride_mins,
         chunksize=1_000_000,
-    )], axis=1)
+    ))
 
-    feats = pd.concat([feats, process_numeric_timeseries_table(
+    blocks.append(process_numeric_timeseries_table(
         table_path=data_dir / "vitalAperiodic.csv.gz",
         pid_col="patientunitstayid",
         offset_col="observationoffset",
@@ -805,9 +808,9 @@ def main() -> None:
         history_mins=history_mins,
         stride_mins=stride_mins,
         chunksize=1_000_000,
-    )], axis=1)
+    ))
 
-    feats = pd.concat([feats, process_numeric_timeseries_table(
+    blocks.append(process_numeric_timeseries_table(
         table_path=data_dir / "lab.csv.gz",
         pid_col="patientunitstayid",
         offset_col="labresultoffset",
@@ -819,9 +822,9 @@ def main() -> None:
         history_mins=history_mins,
         stride_mins=stride_mins,
         chunksize=800_000,
-    )], axis=1)
+    ))
 
-    feats = pd.concat([feats, process_numeric_timeseries_table(
+    blocks.append(process_numeric_timeseries_table(
         table_path=data_dir / "intakeOutput.csv.gz",
         pid_col="patientunitstayid",
         offset_col="intakeoutputoffset",
@@ -833,9 +836,9 @@ def main() -> None:
         history_mins=history_mins,
         stride_mins=stride_mins,
         chunksize=800_000,
-    )], axis=1)
+    ))
 
-    feats = pd.concat([feats, process_numeric_timeseries_table(
+    blocks.append(process_numeric_timeseries_table(
         table_path=data_dir / "respiratoryCare.csv.gz",
         pid_col="patientunitstayid",
         offset_col="respcarestatusoffset",
@@ -855,9 +858,9 @@ def main() -> None:
         history_mins=history_mins,
         stride_mins=stride_mins,
         chunksize=800_000,
-    )], axis=1)
+    ))
 
-    feats = pd.concat([feats, process_numeric_timeseries_table(
+    blocks.append(process_numeric_timeseries_table(
         table_path=data_dir / "infusionDrug.csv.gz",
         pid_col="patientunitstayid",
         offset_col="infusionoffset",
@@ -869,7 +872,7 @@ def main() -> None:
         history_mins=history_mins,
         stride_mins=stride_mins,
         chunksize=800_000,
-    )], axis=1)
+    ))
 
     rch_path = data_dir / "respiratoryCharting.csv.gz"
     rch_labels = find_top_numeric_labels(
@@ -882,7 +885,7 @@ def main() -> None:
     print("#############################")
     print(f"RespChart top numeric labels (first 20): {rch_labels[:20]}")
     print("#############################")
-    feats = pd.concat([feats, process_charting_pivot(
+    blocks.append(process_charting_pivot(
         table_path=rch_path,
         pid_col="patientunitstayid",
         offset_col="respchartoffset",
@@ -895,7 +898,7 @@ def main() -> None:
         stride_mins=stride_mins,
         top_labels=rch_labels,
         chunksize=800_000,
-    )], axis=1)
+    ))
 
     nch_path = data_dir / "nurseCharting.csv.gz"
     nch_labels = find_top_numeric_labels(
@@ -908,7 +911,7 @@ def main() -> None:
     print("#############################")
     print(f"NurseChart top numeric labels (first 20): {nch_labels[:20]}")
     print("#############################")
-    feats = pd.concat([feats, process_charting_pivot(
+    blocks.append(process_charting_pivot(
         table_path=nch_path,
         pid_col="patientunitstayid",
         offset_col="nursingchartoffset",
@@ -921,9 +924,9 @@ def main() -> None:
         stride_mins=stride_mins,
         top_labels=nch_labels,
         chunksize=800_000,
-    )], axis=1)
+    ))
 
-    feats = pd.concat([feats, process_count_table(
+    blocks.append(process_count_table(
         table_path=data_dir / "medication.csv.gz",
         pid_col="patientunitstayid",
         offset_col="drugstartoffset",
@@ -933,18 +936,18 @@ def main() -> None:
         stride_mins=stride_mins,
         chunksize=800_000,
         out_col="med_count_in_window",
-    )], axis=1)
+    ))
 
-    feats = pd.concat([feats, process_treatment_dialysis(
+    blocks.append(process_treatment_dialysis(
         table_path=data_dir / "treatment.csv.gz",
         sample_index_df=sample_index_df,
         n_samples=n_samples,
         history_mins=history_mins,
         stride_mins=stride_mins,
         chunksize=800_000,
-    )], axis=1)
+    ))
 
-    feats = pd.concat([feats, process_count_table(
+    blocks.append(process_count_table(
         table_path=data_dir / "nurseAssessment.csv.gz",
         pid_col="patientunitstayid",
         offset_col="nurseassessoffset",
@@ -954,9 +957,9 @@ def main() -> None:
         stride_mins=stride_mins,
         chunksize=800_000,
         out_col="nurseassess_count_in_window",
-    )], axis=1)
+    ))
 
-    feats = pd.concat([feats, process_count_table(
+    blocks.append(process_count_table(
         table_path=data_dir / "nurseCare.csv.gz",
         pid_col="patientunitstayid",
         offset_col="nursecareoffset",
@@ -966,24 +969,54 @@ def main() -> None:
         stride_mins=stride_mins,
         chunksize=800_000,
         out_col="nursecare_count_in_window",
-    )], axis=1)
+    ))
 
-    feats = pd.concat([feats, process_infusion_vasopressor_any(
+    blocks.append(process_infusion_vasopressor_any(
         table_path=data_dir / "infusionDrug.csv.gz",
         sample_index_df=sample_index_df,
         n_samples=n_samples,
         history_mins=history_mins,
         stride_mins=stride_mins,
         chunksize=800_000,
-    )], axis=1)
+    ))
+
+    print("#############################")
+    print("Final concatenation of feature blocks")
+    print("#############################")
+
+    feats = pd.concat(blocks, axis=1, copy=False)
+
+    if feats.columns.duplicated().any():
+        new_cols = []
+        seen: Dict[str, int] = {}
+        for c in feats.columns:
+            if c not in seen:
+                seen[c] = 1
+                new_cols.append(c)
+            else:
+                seen[c] += 1
+                new_cols.append(f"{c}__dup{seen[c]}")
+        feats.columns = new_cols
+
+    # Add vitals missingness mask features (vp_/va_) so GRU sees the same feature space as feature selection
+    feats = add_vitals_missingness_masks(feats)
 
     print("#############################")
     print("Saving features parquet")
     print("#############################")
     out_features.parent.mkdir(parents=True, exist_ok=True)
+
+    for c in feats.columns:
+        if c in ["patientunitstayid", "t_end"]:
+            continue
+        if pd.api.types.is_numeric_dtype(feats[c]):
+            feats[c] = feats[c].astype(np.float32, copy=False)
+
     feats.to_parquet(out_features, index=False)
+
     print(f"Saved: {out_features}")
     print(f"Final shape: {feats.shape}")
+    print("#############################")
 
 
 if __name__ == "__main__":

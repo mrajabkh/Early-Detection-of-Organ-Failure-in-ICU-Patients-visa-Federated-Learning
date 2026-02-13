@@ -46,25 +46,99 @@ HORIZON_MINS = HORIZON_HRS * 60
 
 
 #############################
-# Sample generation / balancing
+# Windowing strategy (Strategy 1)
+#############################
+WINDOWING_STRATEGY = "strategy1"
+NON_EVENT_N_MULT = 2  # N = 2H
+
+
+#############################
+# Optional: cap total windows by sampling patients
+#############################
+WINDOW_CAP_ENABLED = True
+MAX_WINDOWS = 1_000_000
+WINDOW_CAP_MODE = "neg_only"  # "both" or "neg_only"
+WINDOW_CAP_RANDOM_STATE = 42
+
+
+#############################
+# Sample generation
 #############################
 SEED = 42
 REQUIRE_FULL_HORIZON = True
+
+
+#############################
+# Optional: balancing (global)
+#############################
+# This controls the 1:1 behavior you observed.
+# If BALANCE_ENABLED is False, prepare_data will NOT downsample negatives to match positives.
+#bad dont use
+BALANCE_ENABLED = False
+
+# Only used if BALANCE_ENABLED is True.
 NEGATIVE_POSITIVE_RATIO = 1.0
 NEGATIVE_WINDOWS_PER_PATIENT_CAP: Optional[int] = None
 
 
 #############################
-# Train/test split + preprocessing
+# Train/val/test split
 #############################
 TEST_SIZE = 0.2
+VAL_SIZE = 0.15
 SPLIT_RANDOM_STATE = 42
 STRATIFY_SPLIT = True
 
+
+#############################
+# Test-only monitoring density filter (Option 3)
+#############################
+APPLY_TEST_DENSITY_FILTER = True
+TEST_DENSITY_POS_QUANTILE = 0.25
+
+# Vitals definition for density: any presence in these columns counts as monitored
+VP_VITAL_COLS = [
+    "heartrate",
+    "respiration",
+    "sao2",
+    "temperature",
+    "systemicmean",
+    "systemicsystolic",
+    "systemicdiastolic",
+]
+
+VA_VITAL_COLS = [
+    "noninvasivemean",
+    "noninvasivesystolic",
+    "noninvasivediastolic",
+]
+
+
+#############################
+# Negative limiter (cap Neg:Pos) applied PER SPLIT after split assignment
+#############################
+# NOTE: Name kept for compatibility, but it now applies to train/val/test.
+TEST_NEG_LIMITER_ENABLED = True
+TEST_NEG_POS_MAX_RATIO = 10.0
+TEST_NEG_LIMITER_RANDOM_STATE = 42
+
+
+USE_POS_WEIGHT = True
+POS_WEIGHT_MAX = 500.0
+
+FS_MAX_TRAIN_ROWS = 70000
+FS_STRATIFIED_SUBSAMPLE = True
+FS_RANDOM_STATE = 42
+
+# how many parquet columns to read per batch (smaller = less RAM)
+FS_PARQUET_COL_BATCH = 40
+
+
+#############################
+# Preprocessing (baseline ML)
+#############################
 IMPUTE_STRATEGY = "median"
 SCALE_NUMERIC = True
-
-SHAP_BACKGROUND_N = 2000
 
 
 #############################
@@ -76,39 +150,22 @@ TOPK_LIST: List[int] = [20, 40, 60, 80, 100]
 #############################
 # Respiratory and nursing charting feature extraction
 #############################
-RESPCHART_TOP_LABELS = 40  # unknown max
-NURSECHART_TOP_LABELS = 48  # 48 max
+RESPCHART_TOP_LABELS = 40
+NURSECHART_TOP_LABELS = 48
 
 
 #############################
-# Stability selection settings
+# Stability selection settings (RF-only now)
 #############################
-# If True, run_topk_models.py will prefer stability_combined ranking when present.
 USE_STABILITY_RANKING = True
 
-# Number of bootstrap runs for stability selection
 STAB_N_BOOTSTRAPS = 15
-
-# Bootstrap sample size as a fraction of training set
 STAB_BOOTSTRAP_FRAC = 0.7
-
-# Stability frequency is computed relative to this reference Top-K
-# Example: a feature appears in top-100 in 12/15 runs => freq 0.80
 STAB_TOPK_REF = 100
-
-# Combine rule: keep features if (freq_lgbm >= THR) OR (freq_rf >= THR)
 STAB_FREQ_THRESHOLD = 0.6
 
-# SHAP parameters (LGBM selector)
-STAB_SHAP_BACKGROUND_N = 1000  # per bootstrap
-
-# RF selector importance mode:
-# - "mdi" = impurity-based importance (fast, default)
-# - "permutation" = permutation importance (slow unless restricted)
 RF_IMPORTANCE_MODE = "mdi"
 
-# Keep permutation mode bounded
-# (only permute top-M features by RF MDI to avoid hours of runtime)
 PERM_N_REPEATS = 1
 PERM_SCORING = "average_precision"
 PERM_MAX_SAMPLES = 2000
@@ -116,7 +173,7 @@ PERM_MAX_FEATURES = 200
 
 
 #############################
-# Model toggles (default only 3 on)
+# Model toggles (baseline ML)
 #############################
 MODEL_ENABLED = {
     "knn": True,
@@ -196,7 +253,7 @@ def run_dir(disease: DiseaseSpec = DISEASE) -> Path:
 
 
 #############################
-# Output filenames (include disease name)
+# Output filenames
 #############################
 def samples_filename(disease: DiseaseSpec = DISEASE) -> str:
     return f"samples__{disease_tag(disease)}.csv"
@@ -206,16 +263,8 @@ def features_filename(disease: DiseaseSpec = DISEASE) -> str:
     return f"features__{disease_tag(disease)}.parquet"
 
 
-def shap_filename(disease: DiseaseSpec = DISEASE) -> str:
-    return f"shap_importance__{disease_tag(disease)}.csv"
-
-
 def results_filename(disease: DiseaseSpec = DISEASE) -> str:
     return f"ML_results__{disease_tag(disease)}.csv"
-
-
-def stability_lgbm_filename(disease: DiseaseSpec = DISEASE) -> str:
-    return f"stability_lgbm_shap__{disease_tag(disease)}.csv"
 
 
 def stability_rf_filename(disease: DiseaseSpec = DISEASE) -> str:
@@ -226,7 +275,6 @@ def stability_combined_filename(disease: DiseaseSpec = DISEASE) -> str:
     return f"stability_combined__{disease_tag(disease)}.csv"
 
 
-# NEW: GRU output filenames
 def gru_results_filename(disease: DiseaseSpec = DISEASE) -> str:
     return f"gru_results__{disease_tag(disease)}.csv"
 
@@ -235,6 +283,9 @@ def gru_checkpoint_filename(disease: DiseaseSpec = DISEASE) -> str:
     return f"gru_checkpoint__{disease_tag(disease)}.pt"
 
 
+#############################
+# Output paths
+#############################
 def samples_path(disease: DiseaseSpec = DISEASE) -> Path:
     return run_dir(disease) / samples_filename(disease)
 
@@ -243,16 +294,8 @@ def features_path(disease: DiseaseSpec = DISEASE) -> Path:
     return run_dir(disease) / features_filename(disease)
 
 
-def shap_path(disease: DiseaseSpec = DISEASE) -> Path:
-    return run_dir(disease) / shap_filename(disease)
-
-
 def results_path(disease: DiseaseSpec = DISEASE) -> Path:
     return run_dir(disease) / results_filename(disease)
-
-
-def stability_lgbm_path(disease: DiseaseSpec = DISEASE) -> Path:
-    return run_dir(disease) / stability_lgbm_filename(disease)
 
 
 def stability_rf_path(disease: DiseaseSpec = DISEASE) -> Path:
@@ -263,7 +306,6 @@ def stability_combined_path(disease: DiseaseSpec = DISEASE) -> Path:
     return run_dir(disease) / stability_combined_filename(disease)
 
 
-# NEW: GRU output paths
 def gru_results_path(disease: DiseaseSpec = DISEASE) -> Path:
     return run_dir(disease) / gru_results_filename(disease)
 
